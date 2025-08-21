@@ -1,4 +1,4 @@
-import os  
+import os
 from glob import glob
 import pandas as pd
 import numpy as np
@@ -15,8 +15,8 @@ from collections import Counter
 TIMEFRAMES = ['5min', '15min', '30min', '1hr', '1D']
 MODEL_PATH = "xgb_stock_trend.json"
 SCALER_PATH = "xgb_scaler.gz"
-TEST_SIZE = 0.10
-PRED_PERIOD = 7 
+TEST_SIZE = 0.1
+PRED_PERIOD = 7  
 
 def load_all_timeframes(timeframes=TIMEFRAMES):
     data_list = []
@@ -40,7 +40,6 @@ def calculate_dynamic_thresholds(df, pred_period=PRED_PERIOD, window=50, upper_q
     DOWN_TH = rolling_down.iloc[-1] if not pd.isna(rolling_down.iloc[-1]) else returns.quantile(lower_q)
     return UP_TH, DOWN_TH
 
-
 def compute_indicators(df, period=PRED_PERIOD):
     df = df.copy()
     span1 = max(7, period)
@@ -52,11 +51,11 @@ def compute_indicators(df, period=PRED_PERIOD):
     df['EMA_1'] = df['Close'].ewm(span=span1, adjust=False).mean()
     df['EMA_2'] = df['Close'].ewm(span=span2, adjust=False).mean()
 
-    # Volatility
+    # Rolling volatility
     df['rolling_vol_1'] = df['log_return'].rolling(max(span1, 2)).std()
     df['rolling_vol_2'] = df['log_return'].rolling(max(span2, 2)).std()
 
-    # Bollinger Bands (ATR-based)
+    # Bollinger Bands
     df['BBM'] = df['Close'].rolling(max(span1,2)).mean()
     tr = pd.concat([df['High'] - df['Low'],
                     (df['High'] - df['Close'].shift(1)).abs(),
@@ -100,7 +99,6 @@ def compute_indicators(df, period=PRED_PERIOD):
     minus_di = 100 * pd.Series(minus_dm).rolling(max(span1,2)).sum() / tr.rolling(max(span1,2)).sum()
     df['ADX'] = 100 * np.abs(plus_di - minus_di) / (plus_di + minus_di + 1e-8)  # avoid div0
 
-    # Fill NaNs
     df.fillna(method="bfill", inplace=True)
     df.fillna(method="ffill", inplace=True)
     return df
@@ -141,6 +139,7 @@ def preprocess(data, period=PRED_PERIOD):
     y = y[X.index]
     return data, X, y, all_features
 
+
 def train_pipeline(period=PRED_PERIOD):
     data = load_all_timeframes()
     data, X, y, features = preprocess(data, period)
@@ -163,55 +162,70 @@ def train_pipeline(period=PRED_PERIOD):
     if sampling_strategy:
         sm = SMOTE(sampling_strategy=sampling_strategy, random_state=42)
         X_train_res, y_train_res = sm.fit_resample(X_train_scaled, y_train)
+        print("Resampled class distribution:", Counter(y_train_res))
     else:
         X_train_res, y_train_res = X_train_scaled, y_train
 
-    print("Resampled class distribution:", Counter(y_train_res))
-
-    classes = np.unique(y_train_res)
-    cw = class_weight.compute_class_weight('balanced', classes=classes, y=y_train_res)
-    sample_weights = np.array([cw[list(classes).index(yy)] for yy in y_train_res])
-
     model = xgb.XGBClassifier(
-        n_estimators=300,
-        max_depth=4,
-        learning_rate=0.05,
-        subsample=0.8,
-        colsample_bytree=0.8,
-        reg_alpha=0.5,
-        reg_lambda=1.0,
-        eval_metric='mlogloss',
-        use_label_encoder=False
+        n_estimators=500, max_depth=4, learning_rate=0.05,
+        subsample=0.8, colsample_bytree=0.8, random_state=42
     )
-
-    model.fit(
-        X_train_res, y_train_res,
-        sample_weight=sample_weights,
-        eval_set=[(X_test_scaled, y_test)],
-        early_stopping_rounds=50, verbose=50
-    )
-
-    model.save_model(MODEL_PATH)
-    print(f"Model saved to: {MODEL_PATH}")
+    model.fit(X_train_res, y_train_res)
 
     y_pred = model.predict(X_test_scaled)
-    sig_acc = (y_test == y_pred).mean() * 100
-    bal_acc = balanced_accuracy_score(y_test, y_pred)
-    print(f"Signal Accuracy: {sig_acc:.2f}%")
-    print(f"Balanced Accuracy: {bal_acc:.4f}")
-    print("\nClassification Report:\n", classification_report(y_test, y_pred, digits=2))
+    print(classification_report(y_test, y_pred, target_names=['Hold','Buy','Sell']))
+    joblib.dump(model, MODEL_PATH)
 
-    cm = confusion_matrix(y_test, y_pred)
-    plt.figure(figsize=(6,5))
-    sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                xticklabels=['Hold(0)','Buy(1)','Sell(2)'],
-                yticklabels=['Hold(0)','Buy(1)','Sell(2)'])
-    plt.xlabel("Predicted")
-    plt.ylabel("Actual")
-    plt.title("Confusion Matrix Heatmap")
-    plt.show()
+    return model, scaler, features
 
-    return model, scaler, features, data
+def calculate_trading_profit(df, pred_period=PRED_PERIOD):
+    profits = []
+    position = None
+    entry_price = 0
+    entry_time = None
+
+    for idx, row in df.iterrows():
+        if row['Trend'] == 1 and position is None:  # BUY signal
+            position = 'long'
+            entry_price = row['Close']
+            entry_time = row['DateTime']
+        elif row['Trend'] == 2 and position == 'long':  # SELL signal
+            sell_idx = idx + pred_period
+            if sell_idx >= len(df):
+                sell_idx = len(df) - 1
+            exit_price = df.iloc[sell_idx]['Close']
+            exit_time = df.iloc[sell_idx]['DateTime']
+            profit = exit_price - entry_price
+            profits.append({
+                'Symbol': df['Symbol'].iloc[0],
+                'Timeframe': df['Timeframe'].iloc[0],
+                'EntryTime': entry_time,
+                'ExitTime': exit_time,
+                'EntryPrice': entry_price,
+                'ExitPrice': exit_price,
+                'Profit': profit
+            })
+            position = None
+    return pd.DataFrame(profits)
+
+def total_profit(profit_df):
+    return profit_df['Profit'].sum()
 
 if __name__ == "__main__":
-    model, scaler, features, data = train_pipeline(PRED_PERIOD)
+    model, scaler, features = train_pipeline(PRED_PERIOD)
+    data = load_all_timeframes()
+    data, X, y, _ = preprocess(data, PRED_PERIOD)
+
+    all_symbols = data['Symbol'].unique()
+    all_profits = []
+
+    for sym in all_symbols:
+        df_sym = data[data['Symbol'] == sym].copy()
+        for tf in df_sym['Timeframe'].unique():
+            df_tf = df_sym[df_sym['Timeframe'] == tf].copy().reset_index(drop=True)
+            profit_df = calculate_trading_profit(df_tf, PRED_PERIOD)
+            all_profits.append(profit_df)
+
+    final_profit_df = pd.concat(all_profits, ignore_index=True)
+    print("Total Profit:", total_profit(final_profit_df))
+    final_profit_df.to_csv("trading_profit.csv", index=False)
