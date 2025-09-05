@@ -4,6 +4,7 @@ XGBoost vs LSTM vs Hybrid
 Includes: feature engineering, LSTM sequences, hybrid voting, backtest & plots
 """
 
+from asyncio import Handle
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -16,6 +17,7 @@ from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
 from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier
 
 PRED_PERIOD = 7
 TIMEFRAMES = ['5min', '15min', '30min', '1hr', '1D']
@@ -24,7 +26,37 @@ LSTM_EPOCHS = 15
 LSTM_BATCH = 64
 
 
-def safe_div(a,b): return a / b.replace(0,np.nan)
+def safe_div(a, b):
+    b = np.where(b==0, np.nan, b)
+    return a / b
+
+def add_price_derivatives(df, use_log=True, ema_span=7):
+    df = df.copy()
+    if 'DateTime' not in df.columns:
+        raise ValueError("DateTime column required")
+    df['DateTime'] = pd.to_datetime(df['DateTime'])
+
+    dt = df['DateTime'].diff().dt.total_seconds() # Time delta in seconds
+    dt.iloc[0] = dt.median() if np.isfinite(dt.median()) else 1.0  # Handle first NaN value
+    dt = dt.replace(0, np.nan).fillna(dt.median() if np.isfinite(dt.median()) else 1.0)  # Avoid division by zero
+
+    series = np.log(df['Close'].clip(lower=1e-12)) if use_log else df['Close']  # Avoid log(0)
+    
+    df['dClose_dt'] = series.diff() / dt # First derivative
+    df['d2Close_dt2'] = df['dClose_dt'].diff() / dt # Second derivative
+
+    # Smooth derivatives
+    df['dClose_dt_ema'] = df['dClose_dt'].ewm(span=ema_span, adjust=False).mean()
+    df['d2Close_dt2_ema'] = df['d2Close_dt2'].ewm(span=ema_span, adjust=False).mean()
+
+    # Handle infinities and NaNs
+    for col in ['dClose_dt', 'd2Close_dt2', 'dClose_dt_ema', 'd2Close_dt2_ema']:
+        df[col] = df[col].replace([np.inf, -np.inf], np.nan)
+    
+    df[['dClose_dt','d2Close_dt2','dClose_dt_ema','d2Close_dt2_ema']] = \
+        df[['dClose_dt','d2Close_dt2','dClose_dt_ema','d2Close_dt2_ema']].fillna(method='bfill').fillna(method='ffill')
+    
+    return df
 
 def compute_indicators_safe(df, period=PRED_PERIOD):
     df = df.copy()
@@ -67,6 +99,8 @@ def compute_indicators_safe(df, period=PRED_PERIOD):
 
 def add_lag_features(df, period=PRED_PERIOD):
     df = df.copy()
+    df = add_price_derivatives(df, use_log=True, ema_span=max(5, period))
+
     for lag in range(1, period+1):
         df[f'Close_lag_{lag}'] = df['Close'].shift(lag)
     for win in [period, period*2, period*3]:
@@ -116,7 +150,13 @@ def train_xgboost(X_train, y_train, X_test):
     y_pred = model.predict(X_test)
     return y_pred, model
 
-def train_lstm(X_train, y_train, X_test):
+def train_random_forest(X_train, y_train, X_test):
+    rf_model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
+    rf_model.fit(X_train, y_train)
+    y_pred = rf_model.predict(X_test)
+    return y_pred, rf_model
+
+def train_lstm(X_train, y_train, X_test, y_test):
     scaler = MinMaxScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
@@ -131,7 +171,7 @@ def train_lstm(X_train, y_train, X_test):
         return np.array(Xs), np.array(ys)
     
     X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train.values)
-    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_train.values[:len(X_test_scaled)])
+    X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test.values)
     
     # LSTM model
     model = Sequential()
@@ -149,12 +189,15 @@ def train_lstm(X_train, y_train, X_test):
     y_pred_full = np.concatenate([np.full(timesteps,0), y_pred])
     return y_pred_full, model
 
-def hybrid_prediction(y_pred_xgb, y_pred_lstm):
+def hybrid_prediction(y_xgb, y_lstm, y_rf, weights=(0.4,0.3,0.3)):
     hybrid_pred = []
-    for x,l in zip(y_pred_xgb, y_pred_lstm):
-        counts = np.bincount([x,l])
-        hybrid_pred.append(np.argmax(counts))
+    for x,l,r in zip(y_xgb,y_lstm,y_rf):
+        scores = np.zeros(3)
+        for pred, w in zip([x,l,r], weights):
+            scores[pred] += w
+        hybrid_pred.append(np.argmax(scores))
     return np.array(hybrid_pred)
+
 
 def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None):
     
@@ -168,36 +211,45 @@ def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None)
 
     for i, row in df_trades.iterrows():
         if position == 0:
-            if row['Pred'] == 1:
+            if row['Pred'] == 1:  # Buy signal
                 position = 1
-                entry_price = row['Close']
-            elif row['Pred'] == 2:
+                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
+            elif row['Pred'] == 2:  # Sell signal
                 position = -1
-                entry_price = row['Close']
-            entry_time = row['DateTime']
-        else:
-            if (position==1 and row['Pred']==2) or (position==-1 and row['Pred']==1):
-                exit_price = row['Close']
-                pnl = (exit_price - entry_price) * position
-                trades.append({'EntryDateTime': entry_time,
-                               'ExitDateTime': row['DateTime'],
-                               'Type': 'Long' if position==1 else 'Short',
-                               'EntryPrice': entry_price,
-                               'ExitPrice': exit_price,
-                               'Profit': pnl})
-                position = 1 if row['Pred']==1 else -1
-                entry_price = row['Close']
+                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
             entry_time = row['DateTime']
 
+        else:
+            if (position==1 and row['Pred']==2) or (position==-1 and row['Pred']==1):
+                exit_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
+                pnl = (exit_price - entry_price) * position
+                trades.append({
+                    'EntryDateTime': entry_time,
+                    'ExitDateTime': row['DateTime'],
+                    'Type': 'Long' if position==1 else 'Short',
+                    'EntryPrice': entry_price,
+                    'ExitPrice': exit_price,
+                    'Profit': pnl
+                })
+                # flip to new trade
+                position = 1 if row['Pred']==1 else -1
+                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
+                entry_time = row['DateTime']
+
+
     if position != 0:
+    # No next open available at dataset end → must close at last Close
         exit_price = df_trades.iloc[-1]['Close']
         pnl = (exit_price - entry_price) * position
-        trades.append({'EntryDateTime': entry_time,
-                       'ExitDateTime': df_trades.iloc[-1]['DateTime'],
-                       'Type': 'Long' if position==1 else 'Short',
-                       'EntryPrice': entry_price,
-                       'ExitPrice': exit_price,
-                       'Profit': pnl})
+        trades.append({
+            'EntryDateTime': entry_time,
+            'ExitDateTime': df_trades.iloc[-1]['DateTime'],
+            'Type': 'Long' if position==1 else 'Short',
+            'EntryPrice': entry_price,
+            'ExitPrice': exit_price,
+            'Profit': pnl
+        })
+    
 
     trades_df = pd.DataFrame(trades)
     total_profit = trades_df['Profit'].sum()
@@ -206,63 +258,63 @@ def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None)
     if global_trades is not None:
         global_trades.extend(trades)
 
-    # Plot cumulative PnL
-    if not trades_df.empty:
-        cum_profit = trades_df['Profit'].cumsum()
-        plt.figure(figsize=(12,4))
-        plt.plot(trades_df['ExitDateTime'], cum_profit, label='Cumulative PnL')
-        plt.xlabel('DateTime'); plt.ylabel('Profit')
-        plt.title(f'{name} — Cumulative PnL')
-        plt.legend(); plt.grid(True)
-        plt.show()
+    # # Plot cumulative PnL
+    # if not trades_df.empty:
+    #     cum_profit = trades_df['Profit'].cumsum()
+    #     plt.figure(figsize=(12,4))
+    #     plt.plot(trades_df['ExitDateTime'], cum_profit, label='Cumulative PnL')
+    #     plt.xlabel('DateTime'); plt.ylabel('Profit')
+    #     plt.title(f'{name} — Cumulative PnL')
+    #     plt.legend(); plt.grid(True)
+    #     plt.show()
 
-    # Confusion matrix
-    cm = confusion_matrix(y_true, y_pred)
-    cm_row = cm.astype(float)/cm.sum(axis=1)[:,None]
-    cm_row = np.nan_to_num(cm_row)
+    # # Confusion matrix
+    # cm = confusion_matrix(y_true, y_pred)
+    # cm_row = cm.astype(float)/cm.sum(axis=1)[:,None]
+    # cm_row = np.nan_to_num(cm_row)
 
-    plt.figure(figsize=(6,5))
-    plt.imshow(cm_row, aspect='auto', cmap='Blues')
-    plt.title(f'{name} — Confusion Matrix (row %)')
-    plt.xlabel('Predicted'); plt.ylabel('Actual')
-    plt.xticks(range(len(CLASSES)), CLASSES)
-    plt.yticks(range(len(CLASSES)), CLASSES)
-    thresh = cm_row.max()/2
-    for i in range(cm.shape[0]):
-        for j in range(cm.shape[1]):
-            plt.text(j,i,f"{cm[i,j]}\n({cm_row[i,j]*100:.1f}%)", ha='center',
-                     color='white' if cm_row[i,j]>thresh else 'black')
-    plt.tight_layout()
-    plt.show()
+    # plt.figure(figsize=(6,5))
+    # plt.imshow(cm_row, aspect='auto', cmap='Blues')
+    # plt.title(f'{name} — Confusion Matrix (row %)')
+    # plt.xlabel('Predicted'); plt.ylabel('Actual')
+    # plt.xticks(range(len(CLASSES)), CLASSES)
+    # plt.yticks(range(len(CLASSES)), CLASSES)
+    # thresh = cm_row.max()/2
+    # for i in range(cm.shape[0]):
+    #     for j in range(cm.shape[1]):
+    #         plt.text(j,i,f"{cm[i,j]}\n({cm_row[i,j]*100:.1f}%)", ha='center',
+    #                  color='white' if cm_row[i,j]>thresh else 'black')
+    # plt.tight_layout()
+    # plt.show()
 
-    # PRF
-    precisions, recalls, f1s, supports = precision_recall_fscore_support(y_true, y_pred, labels=range(len(CLASSES)))
-    x = np.arange(len(CLASSES))
-    width = 0.22
-    plt.figure(figsize=(8,4))
-    plt.bar(x - width, precisions, width=width, label='Precision')
-    plt.bar(x, recalls, width=width, label='Recall')
-    plt.bar(x + width, f1s, width=width, label='F1-score')
-    plt.xticks(x, CLASSES)
-    plt.ylim(0,1.02)
-    plt.title(f'{name} — Precision/Recall/F1')
-    plt.legend()
-    for i in x:
-        plt.text(i - width, precisions[i]+0.02, f"{precisions[i]:.2f}", ha='center')
-        plt.text(i, recalls[i]+0.02, f"{recalls[i]:.2f}", ha='center')
-        plt.text(i + width, f1s[i]+0.02, f"{f1s[i]:.2f}", ha='center')
-    plt.tight_layout()
-    plt.show()
+    # # PRF
+    # precisions, recalls, f1s, supports = precision_recall_fscore_support(y_true, y_pred, labels=range(len(CLASSES)))
+    # x = np.arange(len(CLASSES))
+    # width = 0.22
+    # plt.figure(figsize=(8,4))
+    # plt.bar(x - width, precisions, width=width, label='Precision')
+    # plt.bar(x, recalls, width=width, label='Recall')
+    # plt.bar(x + width, f1s, width=width, label='F1-score')
+    # plt.xticks(x, CLASSES)
+    # plt.ylim(0,1.02)
+    # plt.title(f'{name} — Precision/Recall/F1')
+    # plt.legend()
+    # for i in x:
+    #     plt.text(i - width, precisions[i]+0.02, f"{precisions[i]:.2f}", ha='center')
+    #     plt.text(i, recalls[i]+0.02, f"{recalls[i]:.2f}", ha='center')
+    #     plt.text(i + width, f1s[i]+0.02, f"{f1s[i]:.2f}", ha='center')
+    # plt.tight_layout()
+    # plt.show()
 
-    # Actual vs Predicted trend
-    df_plot = df_feat.iloc[y_true.index]
-    plt.figure(figsize=(15,4))
-    plt.plot(df_plot['DateTime'], y_true, label='Actual', alpha=0.7)
-    plt.plot(df_plot['DateTime'], y_pred, label='Predicted', alpha=0.7)
-    plt.xlabel('DateTime'); plt.ylabel('Trend')
-    plt.title(f'{name} — Actual vs Predicted Trend')
-    plt.legend()
-    plt.show()
+    # # Actual vs Predicted trend
+    # df_plot = df_feat.iloc[y_true.index]
+    # plt.figure(figsize=(15,4))
+    # plt.plot(df_plot['DateTime'], y_true, label='Actual', alpha=0.7)
+    # plt.plot(df_plot['DateTime'], y_pred, label='Predicted', alpha=0.7)
+    # plt.xlabel('DateTime'); plt.ylabel('Trend')
+    # plt.title(f'{name} — Actual vs Predicted Trend')
+    # plt.legend()
+    # plt.show()
 
     print(f"{name} Overall accuracy: {accuracy_score(y_true, y_pred)}\n")
     print(f"{name} Classification report:\n")
@@ -292,12 +344,16 @@ def run_pipeline():
             backtest_and_plot(df_feat, y_test, y_pred_xgb, 'XGBoost', global_trades)
             plot_importance(model_xgb, max_num_features=20); plt.show()
             
+            # --- Random Forest
+            y_pred_rf, model_rf = train_random_forest(X_train, y_train, X_test)
+            backtest_and_plot(df_feat, y_test, y_pred_rf, 'Random Forest', global_trades)
+
             # --- LSTM
-            y_pred_lstm, model_lstm = train_lstm(X_train, y_train, X_test)
+            y_pred_lstm, model_lstm = train_lstm(X_train, y_train, X_test, y_test)
             backtest_and_plot(df_feat, y_test, y_pred_lstm, 'LSTM', global_trades)
             
             # --- Hybrid
-            y_pred_hybrid = hybrid_prediction(y_pred_xgb, y_pred_lstm)
+            y_pred_hybrid = hybrid_prediction(y_pred_xgb, y_pred_lstm, y_pred_rf)
             backtest_and_plot(df_feat, y_test, y_pred_hybrid, 'Hybrid', global_trades)
     
     # Combined PnL across all timeframes
