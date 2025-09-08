@@ -5,6 +5,7 @@ Includes: feature engineering, LSTM sequences, hybrid voting, backtest & plots
 """
 
 from asyncio import Handle
+from collections import defaultdict
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -20,7 +21,7 @@ from sklearn.preprocessing import MinMaxScaler
 from sklearn.ensemble import RandomForestClassifier
 
 PRED_PERIOD = 7
-TIMEFRAMES = ['5min', '15min', '30min', '1hr', '1D']
+TIMEFRAMES = [ '1D']
 CLASSES = ['Sideways', 'Up', 'Down']  # Trend classes
 LSTM_EPOCHS = 15
 LSTM_BATCH = 64
@@ -199,7 +200,7 @@ def hybrid_prediction(y_xgb, y_lstm, y_rf, weights=(0.4,0.3,0.3)):
     return np.array(hybrid_pred)
 
 
-def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None):
+def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None, global_metrics=None):
     
     df_trades = df_feat.iloc[y_true.index].copy()
     df_trades['Pred'] = y_pred
@@ -320,12 +321,18 @@ def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None)
     print(f"{name} Classification report:\n")
     print(classification_report(y_true, y_pred, target_names=CLASSES))
 
+    # Save global predictions
+    if global_metrics is not None:
+        global_metrics[name]["y_true"].extend(y_true.tolist())
+        global_metrics[name]["y_pred"].extend(y_pred.tolist())
+
 
 def run_pipeline():
-    global_trades = []  
+    global_trades = []
+    global_metrics = defaultdict(lambda: {"y_true": [], "y_pred": []})  # ✅ init here
 
     for tf in TIMEFRAMES:
-        files = glob(f"resampled_{tf}_NSE*.csv")
+        files = glob(f"./data/*_{tf}.csv")
         for file in files:
             print(f"\nProcessing {file}...")
             df = pd.read_csv(file)
@@ -341,25 +348,33 @@ def run_pipeline():
             
             # --- XGBoost
             y_pred_xgb, model_xgb = train_xgboost(X_train, y_train, X_test)
-            backtest_and_plot(df_feat, y_test, y_pred_xgb, 'XGBoost', global_trades)
-            plot_importance(model_xgb, max_num_features=20); plt.show()
+            backtest_and_plot(df_feat, y_test, y_pred_xgb, 'XGBoost', global_trades, global_metrics)
+            # plot_importance(model_xgb, max_num_features=20); plt.show()
             
             # --- Random Forest
             y_pred_rf, model_rf = train_random_forest(X_train, y_train, X_test)
-            backtest_and_plot(df_feat, y_test, y_pred_rf, 'Random Forest', global_trades)
+            backtest_and_plot(df_feat, y_test, y_pred_rf, 'Random Forest', global_trades, global_metrics)
 
             # --- LSTM
             y_pred_lstm, model_lstm = train_lstm(X_train, y_train, X_test, y_test)
-            backtest_and_plot(df_feat, y_test, y_pred_lstm, 'LSTM', global_trades)
-            
+            backtest_and_plot(df_feat, y_test, y_pred_lstm, 'LSTM', global_trades, global_metrics)
+
             # --- Hybrid
             y_pred_hybrid = hybrid_prediction(y_pred_xgb, y_pred_lstm, y_pred_rf)
-            backtest_and_plot(df_feat, y_test, y_pred_hybrid, 'Hybrid', global_trades)
-    
+            backtest_and_plot(df_feat, y_test, y_pred_hybrid, 'Hybrid', global_trades, global_metrics)
+
     # Combined PnL across all timeframes
     if global_trades:
         combined_profit = sum([t['Profit'] for t in global_trades])
         print(f"\nCombined Total Profit/Loss across all timeframes: {combined_profit}")
+
+        print("\n=== Overall Accuracy Across All Files/Timeframes ===")
+
+    for model_name, data in global_metrics.items():
+        y_true_all = np.array(data["y_true"])
+        y_pred_all = np.array(data["y_pred"])
+        acc = accuracy_score(y_true_all, y_pred_all)
+        print(f"{model_name}: {acc:.4f}")
 
 if __name__=="__main__":
     run_pipeline()

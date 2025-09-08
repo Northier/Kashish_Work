@@ -1,37 +1,35 @@
 import pandas as pd
-
-data = pd.read_csv("questdb-query-1754912225193.csv")
-
-
-data['DateTime'] = pd.to_datetime(data['DateTime'])
-
-#make the time the index. 
-data = data.set_index("DateTime")
-
-# Extract time range
-start_time = pd.to_datetime("09:15:00").time()
-end_time = pd.to_datetime("15:29:00").time()
-
-data = data[(data.index.time >= start_time) & (data.index.time <= end_time)]
+import os
 
 
-resample_data_30min = data.groupby(pd.Grouper(freq='1H',offset = '15min')).agg({"Symbol":"first",
-                                                                "Open": "first",
-                                                                "High": "max",
-                                                                "Low": "min",
-                                                                "Close": "last", 
-                                                                "Volume": "sum"}).reset_index()
+timeframes = [ "5Min", "15Min", "30Min", "1H", "1D"]
+stocks = ["ABB", "INDHOTEL"]
+path = "./data/"
 
-resample_data_30min.columns = ["DateTime", "Symbol", "Open", "High", "Low", "Close", "Volume"]
+for stock in stocks:
+    data = pd.read_csv(f"{path}{stock}.csv")
+    data['DateTime'] = pd.to_datetime(data['DateTime'])
+    data = data.set_index("DateTime")
 
-# Now reorder to match your desired format: Symbol first
-resample_data_30min = resample_data_30min[["Symbol", "DateTime", "Open", "High", "Low", "Close", "Volume"]]
+    start_time = pd.to_datetime("09:15:00").time()
+    end_time = pd.to_datetime("15:29:00").time()
+    data = data[(data.index.time >= start_time) & (data.index.time <= end_time)]
 
-resample_data_30min = resample_data_30min.dropna()
+    for tf in timeframes:
+        freq = tf
+        offset = '15min' if tf in ['1H', '30Min', '15Min', '5Min'] else '0min'
+        # Apply the resampling
 
-print(resample_data_30min)
-   
+        resample_data = data.groupby(pd.Grouper(freq=freq, offset=offset)).agg({"Symbol":"first",
+                                                                                  "Open": "first",
+                                                                                  "High": "max",
+                                                                                  "Low": "min",
+                                                                                  "Close": "last", 
+                                                                                  "Volume": "sum"}).reset_index()
+        
+        resample_data.columns = ["DateTime", "Symbol", "Open", "High", "Low", "Close", "Volume"]
+        resample_data = resample_data[["Symbol", "DateTime", "Open", "High", "Low", "Close", "Volume"]]
+        resample_data = resample_data.dropna()
+        resample_data.to_csv(f"{path}{stock}_{tf}.csv", index=False)
 
-resample_data_30min.to_csv('resampled_1hr_NSE_ABB.csv',index = False)
-
-
+        print(resample_data)
