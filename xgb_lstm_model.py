@@ -156,14 +156,14 @@ def train_random_forest(X_train, y_train, X_test):
     rf_model.fit(X_train, y_train)
     y_pred = rf_model.predict(X_test)
     return y_pred, rf_model
-
 def train_lstm(X_train, y_train, X_test, y_test):
     scaler = MinMaxScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
     
-    # Reshape sequences
     timesteps = PRED_PERIOD
+    
+    # Create sequences
     def create_sequences(X, y):
         Xs, ys = [], []
         for i in range(timesteps, len(X)):
@@ -184,11 +184,20 @@ def train_lstm(X_train, y_train, X_test, y_test):
     model.fit(X_train_seq, y_train_seq, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH,
               validation_split=0.1, verbose=0, callbacks=[EarlyStopping(patience=5)])
     
-    y_pred_prob = model.predict(X_test_seq)
-    y_pred = np.argmax(y_pred_prob, axis=1)
-    # Pad to match length
-    y_pred_full = np.concatenate([np.full(timesteps,0), y_pred])
-    return y_pred_full, model
+    # Predict
+    y_pred_train = np.argmax(model.predict(X_train_seq), axis=1)
+    y_pred_test = np.argmax(model.predict(X_test_seq), axis=1)
+    
+    # Pad at the beginning to match original X lengths
+    y_pred_train_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_train])
+    y_pred_test_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_test])
+    
+    # Truncate to exactly match X lengths
+    y_pred_train_full = y_pred_train_full[:len(X_train)]
+    y_pred_test_full = y_pred_test_full[:len(X_test)]
+    
+    return y_pred_train_full, y_pred_test_full, model
+
 
 def hybrid_prediction(y_xgb, y_lstm, y_rf, weights=(0.4,0.3,0.3)):
     hybrid_pred = []
@@ -199,137 +208,110 @@ def hybrid_prediction(y_xgb, y_lstm, y_rf, weights=(0.4,0.3,0.3)):
         hybrid_pred.append(np.argmax(scores))
     return np.array(hybrid_pred)
 
-
-def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None, global_metrics=None):
-    
-    df_trades = df_feat.iloc[y_true.index].copy()
+def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None, return_trades=False):
+    """
+    Backtest trading signals:
+    - Signals are generated at current close.
+    - Trades executed at next bar open.
+    - Can return tradebook if return_trades=True.
+    """
+    df_trades = df_feat.copy()  # use the df_feat passed, no indexing needed
     df_trades['Pred'] = y_pred
     df_trades['Actual'] = y_true
+
+    # Shift predictions by 1 bar for realistic next-open execution
+    df_trades['Pred_shifted'] = df_trades['Pred'].shift(1, fill_value=0)
 
     trades = []
     position = 0
     entry_price = 0
+    entry_time = None
 
     for i, row in df_trades.iterrows():
+        signal = row['Pred_shifted']
+
         if position == 0:
-            if row['Pred'] == 1:  # Buy signal
+            if signal == 1:
                 position = 1
-                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
-            elif row['Pred'] == 2:  # Sell signal
+                entry_price = row['Open']
+                entry_time = row['DateTime']
+            elif signal == 2:
                 position = -1
-                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
-            entry_time = row['DateTime']
+                entry_price = row['Open']
+                entry_time = row['DateTime']
 
         else:
-            if (position==1 and row['Pred']==2) or (position==-1 and row['Pred']==1):
-                exit_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
+            if (position == 1 and signal == 2) or (position == -1 and signal == 1):
+                exit_price = row['Open']
                 pnl = (exit_price - entry_price) * position
                 trades.append({
                     'EntryDateTime': entry_time,
                     'ExitDateTime': row['DateTime'],
-                    'Type': 'Long' if position==1 else 'Short',
+                    'Type': 'Long' if position == 1 else 'Short',
                     'EntryPrice': entry_price,
                     'ExitPrice': exit_price,
                     'Profit': pnl
                 })
-                # flip to new trade
-                position = 1 if row['Pred']==1 else -1
-                entry_price = df_trades.loc[i + 1, 'Open'] if i+1 in df_trades.index else row['Close']
+                # flip position
+                position = 1 if signal == 1 else -1
+                entry_price = row['Open']
                 entry_time = row['DateTime']
 
-
+    # Close any open position at last bar's close
     if position != 0:
-    # No next open available at dataset end → must close at last Close
         exit_price = df_trades.iloc[-1]['Close']
         pnl = (exit_price - entry_price) * position
         trades.append({
             'EntryDateTime': entry_time,
             'ExitDateTime': df_trades.iloc[-1]['DateTime'],
-            'Type': 'Long' if position==1 else 'Short',
+            'Type': 'Long' if position == 1 else 'Short',
             'EntryPrice': entry_price,
             'ExitPrice': exit_price,
             'Profit': pnl
         })
-    
 
     trades_df = pd.DataFrame(trades)
     total_profit = trades_df['Profit'].sum()
-    print(f"{name} Total Profit/Loss (this timeframe): {total_profit}")
+    print(f"{name} Total Profit: {total_profit}")
+    print(f"{name} Overall Accuracy: {accuracy_score(y_true, y_pred)}")
+    
+    if not trades_df.empty:
+        print(f"{name} Tradebook (first 5 trades):")
+        print(trades_df.head())
 
     if global_trades is not None:
         global_trades.extend(trades)
 
-    # # Plot cumulative PnL
-    # if not trades_df.empty:
-    #     cum_profit = trades_df['Profit'].cumsum()
-    #     plt.figure(figsize=(12,4))
-    #     plt.plot(trades_df['ExitDateTime'], cum_profit, label='Cumulative PnL')
-    #     plt.xlabel('DateTime'); plt.ylabel('Profit')
-    #     plt.title(f'{name} — Cumulative PnL')
-    #     plt.legend(); plt.grid(True)
-    #     plt.show()
+    if return_trades:
+        return trades_df, total_profit
+    return total_profit
 
-    # # Confusion matrix
-    # cm = confusion_matrix(y_true, y_pred)
-    # cm_row = cm.astype(float)/cm.sum(axis=1)[:,None]
-    # cm_row = np.nan_to_num(cm_row)
+def create_tradebook(model_tradebooks):
+    """
+    Combine all trades from different models and datasets into a single DataFrame
+    for review.
+    """
+    tradebook_list = []
 
-    # plt.figure(figsize=(6,5))
-    # plt.imshow(cm_row, aspect='auto', cmap='Blues')
-    # plt.title(f'{name} — Confusion Matrix (row %)')
-    # plt.xlabel('Predicted'); plt.ylabel('Actual')
-    # plt.xticks(range(len(CLASSES)), CLASSES)
-    # plt.yticks(range(len(CLASSES)), CLASSES)
-    # thresh = cm_row.max()/2
-    # for i in range(cm.shape[0]):
-    #     for j in range(cm.shape[1]):
-    #         plt.text(j,i,f"{cm[i,j]}\n({cm_row[i,j]*100:.1f}%)", ha='center',
-    #                  color='white' if cm_row[i,j]>thresh else 'black')
-    # plt.tight_layout()
-    # plt.show()
+    for model_name, sets in model_tradebooks.items():
+        for dataset_type, df_trades in sets.items():
+            if df_trades is not None and not df_trades.empty:
+                df = df_trades.copy()
+                df['Model'] = model_name
+                df['Dataset'] = dataset_type
+                tradebook_list.append(df)
 
-    # # PRF
-    # precisions, recalls, f1s, supports = precision_recall_fscore_support(y_true, y_pred, labels=range(len(CLASSES)))
-    # x = np.arange(len(CLASSES))
-    # width = 0.22
-    # plt.figure(figsize=(8,4))
-    # plt.bar(x - width, precisions, width=width, label='Precision')
-    # plt.bar(x, recalls, width=width, label='Recall')
-    # plt.bar(x + width, f1s, width=width, label='F1-score')
-    # plt.xticks(x, CLASSES)
-    # plt.ylim(0,1.02)
-    # plt.title(f'{name} — Precision/Recall/F1')
-    # plt.legend()
-    # for i in x:
-    #     plt.text(i - width, precisions[i]+0.02, f"{precisions[i]:.2f}", ha='center')
-    #     plt.text(i, recalls[i]+0.02, f"{recalls[i]:.2f}", ha='center')
-    #     plt.text(i + width, f1s[i]+0.02, f"{f1s[i]:.2f}", ha='center')
-    # plt.tight_layout()
-    # plt.show()
-
-    # # Actual vs Predicted trend
-    # df_plot = df_feat.iloc[y_true.index]
-    # plt.figure(figsize=(15,4))
-    # plt.plot(df_plot['DateTime'], y_true, label='Actual', alpha=0.7)
-    # plt.plot(df_plot['DateTime'], y_pred, label='Predicted', alpha=0.7)
-    # plt.xlabel('DateTime'); plt.ylabel('Trend')
-    # plt.title(f'{name} — Actual vs Predicted Trend')
-    # plt.legend()
-    # plt.show()
-
-    print(f"{name} Overall accuracy: {accuracy_score(y_true, y_pred)}\n")
-    print(f"{name} Classification report:\n")
-    print(classification_report(y_true, y_pred, target_names=CLASSES))
-
-    # Save global predictions
-    if global_metrics is not None:
-        global_metrics[name]["y_true"].extend(y_true.tolist())
-        global_metrics[name]["y_pred"].extend(y_pred.tolist())
-
+    if tradebook_list:
+        tradebook = pd.concat(tradebook_list, ignore_index=True)
+        # Sort by EntryDateTime for easier review
+        tradebook.sort_values(by='EntryDateTime', inplace=True)
+        return tradebook
+    else:
+        return pd.DataFrame()  # empty if no trades
 
 def run_pipeline():
-    global_trades = []
-    global_metrics = defaultdict(lambda: {"y_true": [], "y_pred": []})  # ✅ init here
+    global_trades = []  # all trades combined
+    model_tradebooks = defaultdict(dict)  # save train/test tradebooks
 
     for tf in TIMEFRAMES:
         files = glob(f"./data/*_{tf}.csv")
@@ -338,43 +320,92 @@ def run_pipeline():
             df = pd.read_csv(file)
             df['DateTime'] = pd.to_datetime(df['DateTime'])
             X, y, df_feat = prepare_data(df)
-            
+
             X.replace([np.inf,-np.inf], np.nan, inplace=True)
             X.fillna(method='bfill', inplace=True)
             X.fillna(method='ffill', inplace=True)
             X = X.clip(-1e10,1e10)
-            
-            X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, shuffle=False)
-            
+
+            # Split train/test
+            split_idx = int(len(X)*0.8)
+            X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
+            y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+
             # --- XGBoost
-            y_pred_xgb, model_xgb = train_xgboost(X_train, y_train, X_test)
-            backtest_and_plot(df_feat, y_test, y_pred_xgb, 'XGBoost', global_trades, global_metrics)
-            # plot_importance(model_xgb, max_num_features=20); plt.show()
-            
-            # --- Random Forest
-            y_pred_rf, model_rf = train_random_forest(X_train, y_train, X_test)
-            backtest_and_plot(df_feat, y_test, y_pred_rf, 'Random Forest', global_trades, global_metrics)
+            y_pred_xgb, model_xgb = train_xgboost(X_train, y_train, X)
+            # Profit & trades for training set
+            trades_train, profit_train = backtest_and_plot(
+                df_feat.iloc[:split_idx], y_train, y_pred_xgb[:split_idx], 
+                'XGBoost Train', return_trades=True
+            )
+
+            trades_test, profit_test = backtest_and_plot(
+                df_feat.iloc[split_idx:], y_test, y_pred_xgb[split_idx:], 
+                'XGBoost Test', return_trades=True
+            )
+
+            model_tradebooks['XGBoost']['Train'] = trades_train
+            model_tradebooks['XGBoost']['Test'] = trades_test
+
+            # Combine all trades
+            global_trades.extend(trades_train.to_dict('records'))
+            global_trades.extend(trades_test.to_dict('records'))
+
+            print(f"XGBoost — Train Profit: {profit_train}, Test Profit: {profit_test}\n")
 
             # --- LSTM
-            y_pred_lstm, model_lstm = train_lstm(X_train, y_train, X_test, y_test)
-            backtest_and_plot(df_feat, y_test, y_pred_lstm, 'LSTM', global_trades, global_metrics)
+            y_pred_train_lstm, y_pred_test_lstm, model_lstm = train_lstm(X_train, y_train, X_test, y_test)
+
+            # Backtest
+            trades_train_lstm, profit_train_lstm = backtest_and_plot(
+                df_feat.iloc[:split_idx], y_train, y_pred_train_lstm, 'LSTM Train', return_trades=True
+            )
+            trades_test_lstm, profit_test_lstm = backtest_and_plot(
+                df_feat.iloc[split_idx:], y_test, y_pred_test_lstm, 'LSTM Test', return_trades=True
+            )
+
+            model_tradebooks['LSTM']['Train'] = trades_train_lstm
+            model_tradebooks['LSTM']['Test'] = trades_test_lstm
+            global_trades.extend(trades_train_lstm.to_dict('records'))
+            global_trades.extend(trades_test_lstm.to_dict('records'))
+            print(f"LSTM — Train Profit: {profit_train_lstm}, Test Profit: {profit_test_lstm}\n")
 
             # --- Hybrid
-            y_pred_hybrid = hybrid_prediction(y_pred_xgb, y_pred_lstm, y_pred_rf)
-            backtest_and_plot(df_feat, y_test, y_pred_hybrid, 'Hybrid', global_trades, global_metrics)
+            y_pred_rf, model_rf = train_random_forest(X_train, y_train, X)
+            # For train hybrid
+            y_pred_train_hybrid = hybrid_prediction(
+                y_pred_xgb[:split_idx], y_pred_train_lstm, y_pred_rf[:split_idx]
+            )
+            
+            # For test hybrid
+            y_pred_test_hybrid = hybrid_prediction(
+                y_pred_xgb[split_idx:], y_pred_test_lstm, y_pred_rf[split_idx:]
+            )
+            trades_train_h, profit_train_h = backtest_and_plot(df_feat.iloc[:split_idx], y_train, y_pred_train_hybrid,
+                                                               'Hybrid Train', return_trades=True)
+            trades_test_h, profit_test_h = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_test_hybrid,
+                                                             'Hybrid Test', return_trades=True)
+            model_tradebooks['Hybrid']['Train'] = trades_train_h
+            model_tradebooks['Hybrid']['Test'] = trades_test_h
+            global_trades.extend(trades_train_h.to_dict('records'))
+            global_trades.extend(trades_test_h.to_dict('records'))
+            print(f"Hybrid — Train Profit: {profit_train_h}, Test Profit: {profit_test_h}\n")
 
-    # Combined PnL across all timeframes
-    if global_trades:
-        combined_profit = sum([t['Profit'] for t in global_trades])
-        print(f"\nCombined Total Profit/Loss across all timeframes: {combined_profit}")
+    # Combined profit for all trades
+    combined_profit = sum([t['Profit'] for t in global_trades])
+    print(f"\nCombined Total Profit (Train+Test, all models): {combined_profit}")
 
-        print("\n=== Overall Accuracy Across All Files/Timeframes ===")
+    # Create a full tradebook
+    full_tradebook = create_tradebook(model_tradebooks)
 
-    for model_name, data in global_metrics.items():
-        y_true_all = np.array(data["y_true"])
-        y_pred_all = np.array(data["y_pred"])
-        acc = accuracy_score(y_true_all, y_pred_all)
-        print(f"{model_name}: {acc:.4f}")
+    # Save to CSV for review
+    full_tradebook.to_csv("full_tradebook_review.csv", index=False)
+    print("\nFull tradebook saved to 'full_tradebook_review.csv'")
+    print(full_tradebook.head(20))  # preview first 20 trades
+
+    return model_tradebooks, global_trades
+
+
 
 if __name__=="__main__":
     run_pipeline()
