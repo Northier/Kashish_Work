@@ -1,31 +1,31 @@
 """
-STOCK MARKET TREND PREDICTION
-XGBoost vs LSTM vs Hybrid
-Includes: feature engineering, LSTM sequences, hybrid voting, backtest & plots
+Stock Market Trend Prediction & Backtesting Pipeline
+- XGBoost / Random Forest / LSTM / Hybrid
+- Proper train/test split
+- Overfitting control
+- Backtesting with tradebook generation
 """
 
-from asyncio import Handle
 from collections import defaultdict
 import pandas as pd
 import numpy as np
-import matplotlib.pyplot as plt
 from glob import glob
-from sklearn.model_selection import train_test_split
-from sklearn.metrics import classification_report, confusion_matrix, precision_recall_fscore_support, accuracy_score
-from xgboost import XGBClassifier, plot_importance
+from sklearn.preprocessing import MinMaxScaler
+from sklearn.ensemble import RandomForestClassifier
+from xgboost import XGBClassifier
 from tensorflow.keras.models import Sequential
 from tensorflow.keras.layers import LSTM, Dense, Dropout
 from tensorflow.keras.optimizers import Adam
 from tensorflow.keras.callbacks import EarlyStopping
-from sklearn.preprocessing import MinMaxScaler
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score
 
+# ------------------ PARAMETERS ------------------
 PRED_PERIOD = 7
-TIMEFRAMES = [ '1D']
-CLASSES = ['Sideways', 'Up', 'Down']  # Trend classes
+TIMEFRAMES = ['1H','1D']
 LSTM_EPOCHS = 15
 LSTM_BATCH = 64
 
+# ------------------ UTILITY FUNCTIONS ------------------
 
 def safe_div(a, b):
     b = np.where(b==0, np.nan, b)
@@ -38,143 +38,135 @@ def add_price_derivatives(df, use_log=True, ema_span=7):
     df['DateTime'] = pd.to_datetime(df['DateTime'])
 
     dt = df['DateTime'].diff().dt.total_seconds() # Time delta in seconds
-    dt.iloc[0] = dt.median() if np.isfinite(dt.median()) else 1.0  # Handle first NaN value
-    dt = dt.replace(0, np.nan).fillna(dt.median() if np.isfinite(dt.median()) else 1.0)  # Avoid division by zero
+    dt.iloc[0] = dt.median() if np.isfinite(dt.median()) else 1.0
+    dt = dt.replace(0, np.nan).fillna(dt.median() if np.isfinite(dt.median()) else 1.0)
 
-    series = np.log(df['Close'].clip(lower=1e-12)) if use_log else df['Close']  # Avoid log(0)
-    
-    df['dClose_dt'] = series.diff() / dt # First derivative
-    df['d2Close_dt2'] = df['dClose_dt'].diff() / dt # Second derivative
+    series = np.log(df['Close'].clip(lower=1e-12)) if use_log else df['Close']
 
-    # Smooth derivatives
+    df['dClose_dt'] = series.diff() / dt
+    df['d2Close_dt2'] = df['dClose_dt'].diff() / dt
+
     df['dClose_dt_ema'] = df['dClose_dt'].ewm(span=ema_span, adjust=False).mean()
     df['d2Close_dt2_ema'] = df['d2Close_dt2'].ewm(span=ema_span, adjust=False).mean()
 
-    # Handle infinities and NaNs
     for col in ['dClose_dt', 'd2Close_dt2', 'dClose_dt_ema', 'd2Close_dt2_ema']:
         df[col] = df[col].replace([np.inf, -np.inf], np.nan)
-    
+
     df[['dClose_dt','d2Close_dt2','dClose_dt_ema','d2Close_dt2_ema']] = \
         df[['dClose_dt','d2Close_dt2','dClose_dt_ema','d2Close_dt2_ema']].fillna(method='bfill').fillna(method='ffill')
-    
+
     return df
+
 
 def compute_indicators_safe(df, period=PRED_PERIOD):
     df = df.copy()
     span1 = max(7, period)
-    df['log_return'] = np.log(df['Close']/df['Close'].shift(1))
     df['EMA_1'] = df['Close'].ewm(span=span1, adjust=False).mean()
     df['EMA_2'] = df['Close'].ewm(span=span1*2, adjust=False).mean()
-    df['BBM'] = df['Close'].rolling(span1).mean()
-    
+    df['log_return'] = np.log(df['Close']/df['Close'].shift(1))
     tr = pd.concat([df['High']-df['Low'],
                     (df['High']-df['Close'].shift(1)).abs(),
                     (df['Low']-df['Close'].shift(1)).abs()], axis=1).max(axis=1)
     df['ATR'] = tr.rolling(span1).mean()
+    df['BBM'] = df['Close'].rolling(span1).mean()
     df['BBU'] = df['BBM'] + 2*df['ATR']
     df['BBL'] = df['BBM'] - 2*df['ATR']
-    
     delta = df['Close'].diff()
     gain = delta.where(delta>0,0)
     loss = -delta.where(delta<0,0)
     avg_gain = gain.rolling(span1).mean()
     avg_loss = loss.rolling(span1).mean()
-    
     rs = safe_div(avg_gain, avg_loss)
     df['RSI'] = 100 - (100/(1+rs))
-    
     low_min = df['Low'].rolling(span1).min()
     high_max = df['High'].rolling(span1).max()
     df['StochK'] = safe_div(100*(df['Close']-low_min), (high_max-low_min))
     df['StochD'] = df['StochK'].rolling(3).mean()
     df['ROC'] = df['Close'].pct_change(period)
-    
-    df.replace([np.inf, -np.inf], np.nan, inplace=True)
     df.fillna(method='bfill', inplace=True)
     df.fillna(method='ffill', inplace=True)
-    
-    numeric_cols = df.select_dtypes(include=[np.number]).columns
-    df[numeric_cols] = df[numeric_cols].clip(lower=-1e6, upper=1e6)
-    
     return df
 
 def add_lag_features(df, period=PRED_PERIOD):
-    df = df.copy()
-    df = add_price_derivatives(df, use_log=True, ema_span=max(5, period))
-
+    df = add_price_derivatives(df, ema_span=max(5, period))
     for lag in range(1, period+1):
         df[f'Close_lag_{lag}'] = df['Close'].shift(lag)
     for win in [period, period*2, period*3]:
         df[f'rolling_mean_{win}'] = df['Close'].rolling(win).mean()
         df[f'rolling_std_{win}'] = df['Close'].rolling(win).std()
     df = compute_indicators_safe(df, period)
-    df.fillna(method="bfill", inplace=True)
-    df.fillna(method="ffill", inplace=True)
+    df.fillna(method='bfill', inplace=True)
+    df.fillna(method='ffill', inplace=True)
     return df
 
-def trend_from_indicators(df):
+def trend_from_indicators(df, roc_threshold=0.01):
     df = df.copy()
-    ema_short = df['Close'].ewm(span=12, adjust=False).mean()
-    ema_long  = df['Close'].ewm(span=26, adjust=False).mean()
-    delta = df['Close'].diff()
+    close = df['Close']
+    ema_short = close.ewm(span=12, adjust=False).mean()
+    ema_long  = close.ewm(span=26, adjust=False).mean()
+    delta = close.diff()
     gain = delta.where(delta>0,0)
     loss = -delta.where(delta<0,0)
-    avg_gain = gain.rolling(14).mean()
-    avg_loss = loss.rolling(14).mean()
-    rs = avg_gain/avg_loss
+    rs = safe_div(gain.rolling(14).mean(), loss.rolling(14).mean())
     rsi = 100 - (100/(1+rs))
-    roc = df['Close'].pct_change(5)
-    
-    trend=[]
-    for i in range(len(df)):
-        if ema_short[i] > ema_long[i] and rsi[i]<70 and roc[i]>0:
-            trend.append(1)
-        elif ema_short[i]<ema_long[i] and rsi[i]>30 and roc[i]<0:
-            trend.append(2)
-        else:
-            trend.append(0)
-    df['Trend']=trend
+    roc = close.pct_change(5)
+    ema_signal = np.where(ema_short > ema_long, 1, 2)
+    rsi_signal = np.where(rsi > 50, 1, 2)
+    roc_signal = np.where(roc > roc_threshold, 1, np.where(roc < -roc_threshold, 2, 0))
+    votes_long = (ema_signal==1).astype(int)+(rsi_signal==1).astype(int)+(roc_signal==1).astype(int)
+    votes_short = (ema_signal==2).astype(int)+(rsi_signal==2).astype(int)+(roc_signal==2).astype(int)
+    trend = np.where(votes_long>=2,1,np.where(votes_short>=2,2,0))
+    df['Trend'] = trend
+    df.fillna(0, inplace=True)
+    df['Trend'] = df['Trend'].astype(int)
     return df
 
 def prepare_data(df):
-    df = add_lag_features(df, PRED_PERIOD)
+    df = add_lag_features(df)
     df = trend_from_indicators(df)
     X = df.drop(columns=['Symbol','DateTime','Trend'], errors='ignore')
     y = df['Trend']
     return X, y, df
 
-
-def train_xgboost(X_train, y_train, X_test):
-    model = XGBClassifier(objective='multi:softmax', num_class=3,
-                          n_estimators=200, learning_rate=0.05, max_depth=5)
-    model.fit(X_train, y_train)
-    y_pred = model.predict(X_test)
+# ------------------ MODEL TRAINING ------------------
+def train_xgboost(X_train, y_train, X_valid=None, y_valid=None):
+    model = XGBClassifier(
+        objective='multi:softmax', num_class=3,
+        n_estimators=500, learning_rate=0.05, max_depth=4,
+        subsample=0.8, colsample_bytree=0.8,
+        use_label_encoder=False, eval_metric='mlogloss'
+    )
+    eval_set = [(X_train, y_train)]
+    if X_valid is not None and y_valid is not None:
+        eval_set.append((X_valid, y_valid))
+        model.fit(X_train, y_train, eval_set=eval_set, early_stopping_rounds=20, verbose=False)
+    else:
+        model.fit(X_train, y_train)
+    y_pred = model.predict(X_valid) if X_valid is not None else model.predict(X_train)
     return y_pred, model
 
-def train_random_forest(X_train, y_train, X_test):
-    rf_model = RandomForestClassifier(n_estimators=100, max_depth=5, random_state=42)
-    rf_model.fit(X_train, y_train)
-    y_pred = rf_model.predict(X_test)
-    return y_pred, rf_model
+def train_random_forest(X_train, y_train, X_valid=None):
+    model = RandomForestClassifier(n_estimators=200, max_depth=5, min_samples_leaf=5, random_state=42)
+    model.fit(X_train, y_train)
+    y_pred = model.predict(X_valid) if X_valid is not None else model.predict(X_train)
+    return y_pred, model
+
 def train_lstm(X_train, y_train, X_test, y_test):
     scaler = MinMaxScaler()
     X_train_scaled = scaler.fit_transform(X_train)
     X_test_scaled = scaler.transform(X_test)
-    
     timesteps = PRED_PERIOD
-    
-    # Create sequences
+
     def create_sequences(X, y):
         Xs, ys = [], []
         for i in range(timesteps, len(X)):
             Xs.append(X[i-timesteps:i])
             ys.append(y[i])
         return np.array(Xs), np.array(ys)
-    
+
     X_train_seq, y_train_seq = create_sequences(X_train_scaled, y_train.values)
     X_test_seq, y_test_seq = create_sequences(X_test_scaled, y_test.values)
-    
-    # LSTM model
+
     model = Sequential()
     model.add(LSTM(64, input_shape=(timesteps, X_train_seq.shape[2]), return_sequences=False))
     model.add(Dropout(0.2))
@@ -183,230 +175,227 @@ def train_lstm(X_train, y_train, X_test, y_test):
     model.compile(optimizer=Adam(0.001), loss='sparse_categorical_crossentropy', metrics=['accuracy'])
     model.fit(X_train_seq, y_train_seq, epochs=LSTM_EPOCHS, batch_size=LSTM_BATCH,
               validation_split=0.1, verbose=0, callbacks=[EarlyStopping(patience=5)])
-    
-    # Predict
-    y_pred_train = np.argmax(model.predict(X_train_seq), axis=1)
+
     y_pred_test = np.argmax(model.predict(X_test_seq), axis=1)
-    
-    # Pad at the beginning to match original X lengths
-    y_pred_train_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_train])
-    y_pred_test_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_test])
-    
-    # Truncate to exactly match X lengths
-    y_pred_train_full = y_pred_train_full[:len(X_train)]
-    y_pred_test_full = y_pred_test_full[:len(X_test)]
-    
+    y_pred_train = np.argmax(model.predict(X_train_seq), axis=1)
+
+    # pad beginning to match original length
+    y_pred_train_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_train])[:len(X_train)]
+    y_pred_test_full = np.concatenate([np.zeros(timesteps, dtype=int), y_pred_test])[:len(X_test)]
+
     return y_pred_train_full, y_pred_test_full, model
 
+# ------------------ HYBRID ------------------
+def hybrid_prediction(y_xgb, y_lstm, y_rf):
+    preds = np.vstack([y_xgb, y_lstm, y_rf]).T
+    hybrid = []
+    for row in preds:
+        long_count = np.sum(row==1)
+        short_count = np.sum(row==2)
+        if long_count>=2:
+            hybrid.append(1)
+        elif short_count>=2:
+            hybrid.append(2)
+        else:
+            hybrid.append(0)
+    return np.array(hybrid, dtype=int)
 
-def hybrid_prediction(y_xgb, y_lstm, y_rf, weights=(0.4,0.3,0.3)):
-    hybrid_pred = []
-    for x,l,r in zip(y_xgb,y_lstm,y_rf):
-        scores = np.zeros(3)
-        for pred, w in zip([x,l,r], weights):
-            scores[pred] += w
-        hybrid_pred.append(np.argmax(scores))
-    return np.array(hybrid_pred)
+# ------------------ BACKTEST ------------------
+from collections import defaultdict
+import numpy as np
+import pandas as pd
+from sklearn.metrics import accuracy_score
+from glob import glob
 
-def backtest_and_plot(df_feat, y_true, y_pred, name='Model', global_trades=None, return_trades=False):
-    """
-    Backtest trading signals:
-    - Signals are generated at current close.
-    - Trades executed at next bar open.
-    - Can return tradebook if return_trades=True.
-    """
-    df_trades = df_feat.copy()  # use the df_feat passed, no indexing needed
-    df_trades['Pred'] = y_pred
-    df_trades['Actual'] = y_true
+# ------------------ BACKTEST ------------------
+from collections import defaultdict
+import pandas as pd
+import numpy as np
+from sklearn.metrics import accuracy_score
+from glob import glob
 
-    # Shift predictions by 1 bar for realistic next-open execution
+# ------------------ BACKTEST ------------------
+def backtest_and_plot(df_feat, y_true, y_pred, name='Model', stop_loss_pct=0.03, take_profit_pct=0.06, max_holding_period=20, return_trades=False):
+    df_trades = df_feat.copy().reset_index(drop=True)
+    df_trades['Pred'] = np.array(y_pred)[:len(df_trades)]
+    df_trades['Actual'] = np.array(y_true)[:len(df_trades)]
     df_trades['Pred_shifted'] = df_trades['Pred'].shift(1, fill_value=0)
 
     trades = []
     position = 0
-    entry_price = 0
+    entry_price = None
     entry_time = None
+    entry_bar = None
 
-    for i, row in df_trades.iterrows():
-        signal = row['Pred_shifted']
+    sl_hits = 0
+    tp_hits = 0
+    holding_periods = []
 
-        if position == 0:
-            if signal == 1:
-                position = 1
-                entry_price = row['Open']
-                entry_time = row['DateTime']
-            elif signal == 2:
-                position = -1
-                entry_price = row['Open']
-                entry_time = row['DateTime']
+    for bar_idx, row in df_trades.iterrows():
+        signal = int(row['Pred_shifted'])
+        current_open = float(row['Open'])
 
-        else:
-            if (position == 1 and signal == 2) or (position == -1 and signal == 1):
-                exit_price = row['Open']
-                pnl = (exit_price - entry_price) * position
+        if position != 0:
+            holding = bar_idx - entry_bar if entry_bar is not None else 0
+            pnl_pct = (current_open - entry_price)/entry_price if position==1 else (entry_price - current_open)/entry_price
+            hit_sl = pnl_pct <= -stop_loss_pct
+            hit_tp = pnl_pct >= take_profit_pct
+
+            if hit_sl or hit_tp or holding >= max_holding_period:
                 trades.append({
                     'EntryDateTime': entry_time,
                     'ExitDateTime': row['DateTime'],
-                    'Type': 'Long' if position == 1 else 'Short',
+                    'Type': 'Long' if position==1 else 'Short',
                     'EntryPrice': entry_price,
-                    'ExitPrice': exit_price,
-                    'Profit': pnl
+                    'ExitPrice': current_open,
+                    'Profit': (current_open - entry_price)*position,
+                    'HoldingBars': holding
                 })
-                # flip position
-                position = 1 if signal == 1 else -1
-                entry_price = row['Open']
-                entry_time = row['DateTime']
+                holding_periods.append(holding)
+                if hit_sl: sl_hits += 1
+                if hit_tp: tp_hits += 1
+                position = 0
+                entry_price = None
+                entry_time = None
+                entry_bar = None
 
-    # Close any open position at last bar's close
+        if position==0:
+            if signal==1:
+                position=1
+                entry_price=current_open
+                entry_time=row['DateTime']
+                entry_bar=bar_idx
+            elif signal==2:
+                position=-1
+                entry_price=current_open
+                entry_time=row['DateTime']
+                entry_bar=bar_idx
+        else:
+            if (position==1 and signal==2) or (position==-1 and signal==1):
+                holding = bar_idx - entry_bar if entry_bar is not None else 0
+                trades.append({
+                    'EntryDateTime': entry_time,
+                    'ExitDateTime': row['DateTime'],
+                    'Type': 'Long' if position==1 else 'Short',
+                    'EntryPrice': entry_price,
+                    'ExitPrice': current_open,
+                    'Profit': (current_open - entry_price)*position,
+                    'HoldingBars': holding
+                })
+                holding_periods.append(holding)
+                position = 1 if signal==1 else -1
+                entry_price = current_open
+                entry_time = row['DateTime']
+                entry_bar = bar_idx
+
     if position != 0:
         exit_price = df_trades.iloc[-1]['Close']
-        pnl = (exit_price - entry_price) * position
+        holding = len(df_trades) - entry_bar
         trades.append({
             'EntryDateTime': entry_time,
             'ExitDateTime': df_trades.iloc[-1]['DateTime'],
-            'Type': 'Long' if position == 1 else 'Short',
+            'Type': 'Long' if position==1 else 'Short',
             'EntryPrice': entry_price,
             'ExitPrice': exit_price,
-            'Profit': pnl
+            'Profit': (exit_price - entry_price)*position,
+            'HoldingBars': holding
         })
+        holding_periods.append(holding)
 
     trades_df = pd.DataFrame(trades)
-    total_profit = trades_df['Profit'].sum()
-    print(f"{name} Total Profit: {total_profit}")
-    print(f"{name} Overall Accuracy: {accuracy_score(y_true, y_pred)}")
-    
-    if not trades_df.empty:
-        print(f"{name} Tradebook (first 5 trades):")
-        print(trades_df.head())
+    total_profit = trades_df['Profit'].sum() if not trades_df.empty else 0
+    acc = accuracy_score(df_trades['Actual'], df_trades['Pred'])
+    win_trades = trades_df[trades_df['Profit']>0].shape[0]
+    total_trades = trades_df.shape[0]
+    win_rate = (win_trades/total_trades*100) if total_trades>0 else 0
+    avg_holding = np.mean(holding_periods) if holding_periods else 0
 
-    if global_trades is not None:
-        global_trades.extend(trades)
+    print(f"{name} Total Profit: {total_profit:.2f}, Accuracy: {acc:.4f}, WinRate: {win_rate:.2f}%, AvgHold: {avg_holding:.2f}, SL Hits: {sl_hits}, TP Hits: {tp_hits}")
+
+    metrics = {
+        'Profit': total_profit,
+        'Accuracy': acc,
+        'WinRate': win_rate,
+        'AvgHolding': avg_holding,
+        'SL_Hits': sl_hits,
+        'TP_Hits': tp_hits
+    }
 
     if return_trades:
-        return trades_df, total_profit
-    return total_profit
+        return trades_df, metrics
+    return metrics
 
-def create_tradebook(model_tradebooks):
-    """
-    Combine all trades from different models and datasets into a single DataFrame
-    for review.
-    """
-    tradebook_list = []
-
-    for model_name, sets in model_tradebooks.items():
-        for dataset_type, df_trades in sets.items():
-            if df_trades is not None and not df_trades.empty:
-                df = df_trades.copy()
-                df['Model'] = model_name
-                df['Dataset'] = dataset_type
-                tradebook_list.append(df)
-
-    if tradebook_list:
-        tradebook = pd.concat(tradebook_list, ignore_index=True)
-        # Sort by EntryDateTime for easier review
-        tradebook.sort_values(by='EntryDateTime', inplace=True)
-        return tradebook
-    else:
-        return pd.DataFrame()  # empty if no trades
+# ------------------ PIPELINE ------------------
+def _get_max_hold_for_timeframe(tf):
+    tf = tf.lower()
+    if '1d' in tf: return 20
+    if '1h' in tf: return 48
+    if '30' in tf: return 96
+    if '15' in tf: return 192
+    if '5' in tf: return 480
+    return 20
 
 def run_pipeline():
-    global_trades = []  # all trades combined
-    model_tradebooks = defaultdict(dict)  # save train/test tradebooks
+    global_trades = []
+    profits_per_model = defaultdict(lambda: defaultdict(float))  # profits_per_model[tf][model]
 
     for tf in TIMEFRAMES:
         files = glob(f"./data/*_{tf}.csv")
         for file in files:
-            print(f"\nProcessing {file}...")
+            print(f"\nProcessing {file} (timeframe={tf})...")
             df = pd.read_csv(file)
             df['DateTime'] = pd.to_datetime(df['DateTime'])
             X, y, df_feat = prepare_data(df)
 
+            # Clean data
             X.replace([np.inf,-np.inf], np.nan, inplace=True)
             X.fillna(method='bfill', inplace=True)
             X.fillna(method='ffill', inplace=True)
             X = X.clip(-1e10,1e10)
 
-            # Split train/test
             split_idx = int(len(X)*0.8)
             X_train, X_test = X.iloc[:split_idx], X.iloc[split_idx:]
             y_train, y_test = y.iloc[:split_idx], y.iloc[split_idx:]
+            max_hold = _get_max_hold_for_timeframe(tf)
 
             # --- XGBoost
-            y_pred_xgb, model_xgb = train_xgboost(X_train, y_train, X)
-            # Profit & trades for training set
-            trades_train, profit_train = backtest_and_plot(
-                df_feat.iloc[:split_idx], y_train, y_pred_xgb[:split_idx], 
-                'XGBoost Train', return_trades=True
-            )
-
-            trades_test, profit_test = backtest_and_plot(
-                df_feat.iloc[split_idx:], y_test, y_pred_xgb[split_idx:], 
-                'XGBoost Test', return_trades=True
-            )
-
-            model_tradebooks['XGBoost']['Train'] = trades_train
-            model_tradebooks['XGBoost']['Test'] = trades_test
-
-            # Combine all trades
-            global_trades.extend(trades_train.to_dict('records'))
-            global_trades.extend(trades_test.to_dict('records'))
-
-            print(f"XGBoost — Train Profit: {profit_train}, Test Profit: {profit_test}\n")
+            y_pred_xgb_train, model_xgb = train_xgboost(X_train, y_train, X_train, y_train)
+            y_pred_xgb_test, _ = train_xgboost(X_train, y_train, X_test, y_test)
+            _, metrics_xgb = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_xgb_test, f"XGBoost ({tf})", max_holding_period=max_hold, return_trades=True)
+            profits_per_model[tf]['XGBoost'] += metrics_xgb['Profit']
 
             # --- LSTM
             y_pred_train_lstm, y_pred_test_lstm, model_lstm = train_lstm(X_train, y_train, X_test, y_test)
+            _, metrics_lstm = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_test_lstm, f"LSTM ({tf})", max_holding_period=max_hold, return_trades=True)
+            profits_per_model[tf]['LSTM'] += metrics_lstm['Profit']
 
-            # Backtest
-            trades_train_lstm, profit_train_lstm = backtest_and_plot(
-                df_feat.iloc[:split_idx], y_train, y_pred_train_lstm, 'LSTM Train', return_trades=True
-            )
-            trades_test_lstm, profit_test_lstm = backtest_and_plot(
-                df_feat.iloc[split_idx:], y_test, y_pred_test_lstm, 'LSTM Test', return_trades=True
-            )
-
-            model_tradebooks['LSTM']['Train'] = trades_train_lstm
-            model_tradebooks['LSTM']['Test'] = trades_test_lstm
-            global_trades.extend(trades_train_lstm.to_dict('records'))
-            global_trades.extend(trades_test_lstm.to_dict('records'))
-            print(f"LSTM — Train Profit: {profit_train_lstm}, Test Profit: {profit_test_lstm}\n")
+            # --- Random Forest
+            y_pred_rf_train, model_rf = train_random_forest(X_train, y_train, X_train)
+            y_pred_rf_test, _ = train_random_forest(X_train, y_train, X_test)
+            _, metrics_rf = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_rf_test, f"RandomForest ({tf})", max_holding_period=max_hold, return_trades=True)
+            profits_per_model[tf]['RandomForest'] += metrics_rf['Profit']
 
             # --- Hybrid
-            y_pred_rf, model_rf = train_random_forest(X_train, y_train, X)
-            # For train hybrid
-            y_pred_train_hybrid = hybrid_prediction(
-                y_pred_xgb[:split_idx], y_pred_train_lstm, y_pred_rf[:split_idx]
-            )
-            
-            # For test hybrid
-            y_pred_test_hybrid = hybrid_prediction(
-                y_pred_xgb[split_idx:], y_pred_test_lstm, y_pred_rf[split_idx:]
-            )
-            trades_train_h, profit_train_h = backtest_and_plot(df_feat.iloc[:split_idx], y_train, y_pred_train_hybrid,
-                                                               'Hybrid Train', return_trades=True)
-            trades_test_h, profit_test_h = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_test_hybrid,
-                                                             'Hybrid Test', return_trades=True)
-            model_tradebooks['Hybrid']['Train'] = trades_train_h
-            model_tradebooks['Hybrid']['Test'] = trades_test_h
-            global_trades.extend(trades_train_h.to_dict('records'))
-            global_trades.extend(trades_test_h.to_dict('records'))
-            print(f"Hybrid — Train Profit: {profit_train_h}, Test Profit: {profit_test_h}\n")
+            y_pred_test_hybrid = hybrid_prediction(y_pred_xgb_test, y_pred_test_lstm, y_pred_rf_test)
+            trades_test, metrics_hybrid = backtest_and_plot(df_feat.iloc[split_idx:], y_test, y_pred_test_hybrid, f"Hybrid ({tf})", max_holding_period=max_hold, return_trades=True)
+            trades_test['Timeframe'] = tf
+            global_trades.extend(trades_test.to_dict('records'))
+            profits_per_model[tf]['Hybrid'] += metrics_hybrid['Profit']
 
-    # Combined profit for all trades
-    combined_profit = sum([t['Profit'] for t in global_trades])
-    print(f"\nCombined Total Profit (Train+Test, all models): {combined_profit}")
+    total_profit = sum([t['Profit'] for t in global_trades])
+    print(f"\nTotal Profit (All Timeframes, Hybrid): {profits_per_model}")
+    print("\nProfit per model per timeframe:")
+    for tf, model_dict in profits_per_model.items():
+        print(f"Timeframe: {tf}")
+        for model, profit in model_dict.items():
+            print(f"  {model}: {profit:.2f}")
 
-    # Create a full tradebook
-    full_tradebook = create_tradebook(model_tradebooks)
-
-    # Save to CSV for review
-    full_tradebook.to_csv("full_tradebook_review.csv", index=False)
+    tradebook_df = pd.DataFrame(global_trades)
+    tradebook_df.to_csv("full_tradebook_review.csv", index=False)
     print("\nFull tradebook saved to 'full_tradebook_review.csv'")
-    print(full_tradebook.head(20))  # preview first 20 trades
+    return tradebook_df, profits_per_model
 
-    return model_tradebooks, global_trades
-
-
-
+# ------------------ RUN ------------------
 if __name__=="__main__":
     run_pipeline()
 
