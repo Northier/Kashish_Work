@@ -2,25 +2,31 @@ import itertools
 import pandas as pd
 import numpy as np
 
-TRADING_COST_EQUITY = 0.002   # 0.2% per leg
-SLIPPAGE_EQUITY = 0.002       # 0.2% per leg
-FIXED_FEE = 100               # flat fee per round-trip trade
-TRADE_NOTIONAL = 100000.0     # capital per round-trip trade
-MAX_RET_CLIP = 0.1            # clip extreme returns to ±10%
+# realistic costs
+TRADING_COST_EQUITY = 0.0015   # 0.15% per leg
+SLIPPAGE_EQUITY = 0.0015       # 0.15% per leg
+FIXED_FEE = 50                 # flat fee per round-trip
+TRADE_NOTIONAL = 50000.0       # smaller notional for 1H
+MAX_RET_CLIP = 0.05            # clip extreme returns ±5%
 
-def run_grid(spread_series: pd.Series, timeframe='1d', max_hold=None):
+
+def run_grid(spread_series: pd.Series, timeframe='1h', max_hold=72):
+    """
+    V2 Arbitrage Strategy tuned for lower timeframes (like 1H)
+    """
 
     if timeframe == '5min':
         lookbacks = [30]; zscores = [1.5]
     elif timeframe == '15min':
-        lookbacks = [30]; zscores = [2.0]
+        lookbacks = [150]; zscores = [2.75]
     elif timeframe == '30min':
-        lookbacks = [90]; zscores = [2.25]
-    elif timeframe == '1h':
-        lookbacks = [120]; zscores = [2.25]
+        lookbacks = [120]
+        zscores =[2.75]
+    if timeframe == '1h':
+        lookbacks = [120]
+        zscores = [2.0]
     elif timeframe == '1d':
-        lookbacks = [120]; zscores = [1.75]
-
+        lookbacks = [150]; zscores = [1.5]
     results = []
 
     for lookback, z in itertools.product(lookbacks, zscores):
@@ -71,7 +77,7 @@ def run_grid(spread_series: pd.Series, timeframe='1d', max_hold=None):
 
         strategy_df['strategy_ret'] = strategy_df['strategy_ret'].clip(lower=-MAX_RET_CLIP, upper=MAX_RET_CLIP)
 
-        strategy_df['strategy_ret'] *= np.random.uniform(0.995, 1.005, size=len(strategy_df))
+        # strategy_df['strategy_ret'] *= np.random.uniform(0.995, 1.005, size=len(strategy_df))
 
         safe_returns = strategy_df['strategy_ret'].where(strategy_df['strategy_ret'] > -1 + 1e-12, -0.9999999999)
         cum_ret = np.exp(np.log1p(safe_returns).cumsum())

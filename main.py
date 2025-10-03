@@ -1,4 +1,4 @@
-# main.py (realistic stat-arb backtest)
+# main.py
 from src.pair_prep import load_pair, compute_returns, rolling_hedge_ratio, adf_test
 from src.strategy import run_grid
 from src.metrics import performance_from_equity
@@ -7,12 +7,11 @@ import os
 
 STOCK_A = 'ABB'
 STOCK_B = 'INDHOTEL'
-TIMEFRAMES = ['5min', '15min', '30min', '1h', '1d']
+TIMEFRAMES = [ '5min'] #'5min', '15min', '30min','1h','1d'
 
 OUT_DIR = './results'
 os.makedirs(OUT_DIR, exist_ok=True)
 
-# Max hold per timeframe
 MAX_HOLD_MAP = {
     '5min': 5,
     '15min': 8,
